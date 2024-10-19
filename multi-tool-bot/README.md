@@ -4,6 +4,15 @@
 
 This is a Discord bot built using Python and the `discord.py` library. The bot includes several useful commands, such as creating polls, setting reminders, starting countdowns, predicting nationalities, showing emoji statistics, running daily trivia, searching for anime, and providing voice channel join alerts. 
 
+<p>
+<img alt="GitHub Contributors" src="https://img.shields.io/github/contributors/mehedisardar/discord-bots" />
+<img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/mehedisardar/discord-bots" />
+<img alt="" src="https://img.shields.io/github/repo-size/mehedisardar/discord-bots" />
+<img alt="GitHub Issues" src="https://img.shields.io/github/issues/mehedisardar/discord-bots" />
+<img alt="GitHub Pull Requests" src="https://img.shields.io/github/issues-pr/mehedisardar/discord-bots" />
+<img alt="Github License" src="https://img.shields.io/github/license/mehedisardar/discord-bots" />
+</p>
+
 ## Features
 
 - **Poll Command**: Create a poll with thumbs up and thumbs down reactions.
