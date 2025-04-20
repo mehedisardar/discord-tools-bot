@@ -9,288 +9,268 @@ import time
 import random
 import aiohttp
 
-# Load the .env file
+# ────────────────────────────  Setup  ────────────────────────────
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 
-# Set up the bot and disable the default help command
-bot = commands.Bot(command_prefix='!', intents=discord.Intents.all(), help_command=None)
+bot = commands.Bot(
+    command_prefix='!',
+    intents=discord.Intents.all(),
+    help_command=None
+)
 
-# Dictionary to keep track of daily trivia scores
+# per‑feature storage
 daily_trivia_scores = {}
+voice_channel_alerts_subscribers: set[int] = set()
+countdown_task: asyncio.Task | None = None
 
-# Dictionary to store users subscribed to voice channel join alerts
-voice_channel_alerts_subscribers = set()
+# ───────────────────────  Small utilities  ───────────────────────
 
-# Event: on_ready
+BAR_LENGTH = 20          # number of ▮ / ▯ characters in the bar
+
+
+def build_progress_bar(elapsed: int, total: int) -> str:
+    """Return a unicode bar such as ▮▮▮▯▯… for the given progress."""
+    filled = round(BAR_LENGTH * elapsed / total) if total else BAR_LENGTH
+    return '▮' * filled + '▯' * (BAR_LENGTH - filled)
+
+
+def format_time(seconds: int) -> str:
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f'{hours}h {minutes}m {seconds}s'
+    return f'{minutes}m {seconds}s'
+
+
+def parse_time(time_str: str) -> int | None:
+    """Convert strings like 20s / 5m / 1h to seconds; returns None on bad input."""
+    match = re.fullmatch(r'(\d+)([smhd])?', time_str.strip().lower())
+    if not match:
+        return None
+
+    amount, unit = int(match.group(1)), match.group(2) or 's'
+    return amount * {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}[unit]
+
+
+# ────────────────────────────  Events  ────────────────────────────
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
 
-# Custom help command
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    # DM all subscribers when someone joins a voice channel
+    if before.channel is None and after.channel is not None:
+        for uid in voice_channel_alerts_subscribers:
+            try:
+                user = await bot.fetch_user(uid)
+                await user.send(f'{member.name} joined **{after.channel.name}**.')
+            except Exception as e:
+                print(f'Failed to DM {uid}: {e}')
+
+
+# ────────────────────────────  Commands  ────────────────────────────
 @bot.command()
 async def help(ctx, *, command_name=None):
+    """Custom help command."""
     if command_name is None:
-        embed = discord.Embed(title="Help", description="Use !help <command> for extended information on a command.", color=0x00ff00)
-        embed.add_field(name="poll", value="Create a poll with thumbs up and thumbs down reactions.", inline=False)
-        embed.add_field(name="remindme", value="Set a reminder. Usage: !remindme <time> <reminder message>", inline=False)
-        embed.add_field(name="count", value="Start a countdown. Usage: !count <time>", inline=False)
-        embed.add_field(name="predict", value="Predict the nationality based on the name. Usage: !predict <name>", inline=False)
-        embed.add_field(name="emojistats", value="Show the most used emojis in the channel. Usage: !emojistats", inline=False)
-        embed.add_field(name="dailytrivia", value="Participate in a daily trivia challenge. Usage: !dailytrivia", inline=False)
-        embed.add_field(name="anime", value="Search for an anime. Usage: !anime <title>", inline=False)
-        embed.add_field(name="voicealerts", value="Subscribe or unsubscribe to voice channel join alerts. Usage: !voicealerts <subscribe/unsubscribe>", inline=False)
+        embed = discord.Embed(
+            title="Help",
+            description="Use `!help <command>` for details.",
+            color=0x00ff00
+        )
+        embed.add_field(name="poll", value="Create a 👍 / 👎 poll.", inline=False)
+        embed.add_field(name="remindme", value="Set a reminder. `!remindme 5m Take a break`", inline=False)
+        embed.add_field(name="count", value="Countdown timer. `!count 30s`", inline=False)
+        embed.add_field(name="predict", value="Guess nationality by name. `!predict Maria`", inline=False)
+        embed.add_field(name="emojistats", value="Show top emojis in channel.", inline=False)
+        embed.add_field(name="dailytrivia", value="One‑question trivia challenge.", inline=False)
+        embed.add_field(name="anime", value="Quick anime lookup via Jikan.", inline=False)
+        embed.add_field(name="voicealerts", value="DM alerts on VC join. `!voicealerts subscribe`", inline=False)
         await ctx.send(embed=embed)
-    else:
-        command = bot.get_command(command_name)
-        if command:
-            embed = discord.Embed(title=f"Help: {command_name}", description=command.help, color=0x00ff00)
-            await ctx.send(embed=embed)
-        else:
-            await ctx.send("Command not found.")
+        return
 
-# Poll command
+    command = bot.get_command(command_name)
+    if command:
+        await ctx.send(embed=discord.Embed(
+            title=f'Help: {command_name}',
+            description=command.help or 'No description.',
+            color=0x00ff00))
+    else:
+        await ctx.send("Command not found.")
+
+
+# ───────────  Polls  ───────────
 @bot.command()
 async def poll(ctx, *, question: str):
-    """Create a poll with thumbs up and thumbs down reactions."""
+    """Create a poll with 👍 / 👎 reactions."""
     embed = discord.Embed(title="Poll", description=question, color=0x00ff00)
     embed.set_footer(text="React with 👍 or 👎")
-    poll_message = await ctx.send(embed=embed)
-    await poll_message.add_reaction('👍')
-    await poll_message.add_reaction('👎')
+    msg = await ctx.send(embed=embed)
+    await msg.add_reaction('👍')
+    await msg.add_reaction('👎')
 
-# Remindme command
+
+# ───────────  Reminders  ───────────
 @bot.command()
-async def remindme(ctx, time: str, *, reminder: str = None):
-    """Set a reminder. Usage: !remindme <time> <reminder message>"""
+async def remindme(ctx, duration: str, *, reminder: str | None = None):
+    """Set a reminder: `!remindme 10m stretch`"""
     if reminder is None:
-        await ctx.send('Error: reminder message is required. Usage: !remindme <time> <reminder message>')
+        await ctx.send("Usage: `!remindme <time> <message>`")
         return
 
-    time_seconds = parse_time(time)
-    if time_seconds is None:
-        await ctx.send('Invalid time format. Please specify time with units (e.g., 30s, 5m, 1h).')
+    seconds = parse_time(duration)
+    if seconds is None:
+        await ctx.send("Invalid time – use formats like 30s, 5m, 1h.")
         return
 
-    await ctx.send(f'Reminder set for {time}.')
-    await asyncio.sleep(time_seconds)
+    await ctx.send(f'⏰ I\'ll remind you in {duration}.')
+    await asyncio.sleep(seconds)
     await ctx.send(f'{ctx.author.mention} Reminder: {reminder}')
 
-# Countdown task
-countdown_task = None
 
+# ───────────  Countdown  ───────────
 @bot.command(name='count')
-async def count(ctx, time: str):
-    """Start a countdown. Usage: !count <time>"""
+async def count(ctx, duration: str):
+    """Start a live countdown: `!count 45s` or `!count 2m`"""
     global countdown_task
 
-    if countdown_task is not None:
+    # cancel any existing timer
+    if countdown_task and not countdown_task.done():
         countdown_task.cancel()
 
-    time_seconds = parse_time(time)
-    if time_seconds is None:
-        await ctx.send('Invalid time format. Please specify time with units (e.g., 30s, 5m, 1h).')
+    seconds = parse_time(duration)
+    if seconds is None or seconds == 0:
+        await ctx.send("Invalid time – use 30s, 5m, 1h, etc.")
         return
 
-    countdown_task = bot.loop.create_task(countdown(ctx, time_seconds))
+    countdown_task = bot.loop.create_task(run_countdown(ctx, seconds))
 
-async def countdown(ctx, total_seconds):
-    start_time = time.time()
-    end_time = start_time + total_seconds
-    message = await ctx.send(f'Countdown: {format_time(total_seconds)} remaining')
 
-    while total_seconds > 0:
-        await asyncio.sleep(1)
-        current_time = time.time()
-        total_seconds = int(end_time - current_time)
-        await message.edit(content=f'Countdown: {format_time(total_seconds)} remaining')
+async def run_countdown(ctx, total_seconds: int):
+    """Edits one message every second with a two‑line progress display."""
+    try:
+        msg = await ctx.send("Preparing countdown…")
+        start = time.monotonic()
 
-    await message.edit(content='Countdown finished!')
-    await ctx.send(f'{ctx.author.mention} Countdown finished!')
+        while True:
+            elapsed   = int(time.monotonic() - start)
+            remaining = max(total_seconds - elapsed, 0)
 
-def format_time(seconds):
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f'{hours}h {minutes}m {seconds}s' if hours else f'{minutes}m {seconds}s'
+            bar = build_progress_bar(elapsed, total_seconds)
+            content = (
+                f"Countdown: {bar}\n"
+                f"{format_time(remaining)}{' – finished!' if remaining == 0 else ' remaining'}"
+            )
+            await msg.edit(content=content)
 
-def parse_time(time_str):
-    pattern = r'(\d+)([smhd]?)'
-    match = re.match(pattern, time_str)
-    if not match:
-        return None
+            if remaining == 0:
+                break
+            await asyncio.sleep(1)
 
-    amount = int(match.group(1))
-    unit = match.group(2)
+        await ctx.send(f'{ctx.author.mention} Countdown finished!')
 
-    if unit == 's':
-        return amount
-    elif unit == 'm':
-        return amount * 60
-    elif unit == 'h':
-        return amount * 3600
-    elif unit == 'd':
-        return amount * 86400
-    else:
-        return None
+    except asyncio.CancelledError:
+        # Clean cancellation if a new !count starts
+        await msg.edit(content="⏹️ Countdown cancelled.")
+        raise
 
-# Emoji statistics command
+
+# ───────────  Emoji statistics  ───────────
 @bot.command()
 async def emojistats(ctx):
-    """Show the most used emojis in the channel. Usage: !emojistats"""
-    emoji_counts = {}
-    async for message in ctx.channel.history(limit=1000):
-        for emoji in message.guild.emojis:
-            if str(emoji) in message.content:
-                if emoji not in emoji_counts:
-                    emoji_counts[emoji] = 0
-                emoji_counts[emoji] += 1
+    """Show the most used custom emojis in the last 1 000 messages."""
+    counts = {}
+    async for m in ctx.channel.history(limit=1000):
+        for e in m.guild.emojis:
+            if str(e) in m.content:
+                counts[e] = counts.get(e, 0) + 1
 
-    sorted_emoji_counts = sorted(emoji_counts.items(), key=lambda x: x[1], reverse=True)
-    if sorted_emoji_counts:
-        stats = '\n'.join([f'{str(emoji)}: {count}' for emoji, count in sorted_emoji_counts])
-        await ctx.send(f'Most used emojis:\n{stats}')
-    else:
-        await ctx.send('No emoji usage data found.')
+    if not counts:
+        await ctx.send("No emoji usage data found.")
+        return
 
-# Daily trivia command
+    info = '\n'.join(f'{e} : {c}' for e, c in sorted(counts.items(), key=lambda x: x[1], reverse=True))
+    await ctx.send(f'Most used emojis:\n{info}')
+
+
+# ───────────  Daily trivia  ───────────
 @bot.command()
 async def dailytrivia(ctx):
-    """Participate in a daily trivia challenge. Usage: !dailytrivia"""
+    """Participate in a single‑question trivia challenge (OpenTDB)."""
     async with aiohttp.ClientSession() as session:
         async with session.get('https://opentdb.com/api.php?amount=1&type=multiple') as resp:
             data = await resp.json()
 
-    question = data['results'][0]['question']
-    correct_answer = data['results'][0]['correct_answer']
-    incorrect_answers = data['results'][0]['incorrect_answers']
-    answers = incorrect_answers + [correct_answer]
-    random.shuffle(answers)
+    q = data['results'][0]
+    question = q['question']
+    correct  = q['correct_answer']
+    options  = q['incorrect_answers'] + [correct]
+    random.shuffle(options)
 
-    embed = discord.Embed(title="Daily Trivia Challenge!", description=question, color=0x00ff00)
-    for i, answer in enumerate(answers, 1):
-        embed.add_field(name=f"Option {i}", value=answer, inline=False)
+    embed = discord.Embed(title="Daily Trivia!", description=question, color=0x00ff00)
+    for i, ans in enumerate(options, 1):
+        embed.add_field(name=f'Option {i}', value=ans, inline=False)
 
-    trivia_message = await ctx.send(embed=embed)
-
-    def check(m):
-        return m.channel == ctx.channel and m.author == ctx.author
-
-    try:
-        msg = await bot.wait_for('message', check=check, timeout=30.0)
-    except asyncio.TimeoutError:
-        await ctx.send(f'Time is up! The correct answer was: {correct_answer}')
-        return
-
-    user = ctx.author
-    if msg.content.lower() == correct_answer.lower():
-        daily_trivia_scores[user.id] = daily_trivia_scores.get(user.id, 0) + 1
-        await ctx.send(f'Correct! 🎉 Your daily score: {daily_trivia_scores[user.id]}')
-    else:
-        await ctx.send(f'Sorry, the correct answer was: {correct_answer}')
-
-# Anime command
-@bot.command()
-async def anime(ctx, *, title: str):
-    """Search for an anime. Usage: !anime <title>"""
-    response = requests.get(f'https://api.jikan.moe/v4/anime?q={title}&limit=1')
-    data = response.json()['data'][0]
-    embed = discord.Embed(title=data['title'], url=data['url'], description=data['synopsis'], color=0x00ff00)
-    embed.set_thumbnail(url=data['images']['jpg']['image_url'])
-    embed.add_field(name='Episodes', value=data['episodes'])
-    embed.add_field(name='Score', value=data['score'])
-    embed.add_field(name='Start Date', value=data['aired']['from'])
-    embed.add_field(name='End Date', value=data['aired']['to'])
     await ctx.send(embed=embed)
 
-# Command to subscribe/unsubscribe to voice channel join alerts
+    def check(m): return m.author == ctx.author and m.channel == ctx.channel
+
+    try:
+        reply = await bot.wait_for('message', check=check, timeout=30)
+    except asyncio.TimeoutError:
+        await ctx.send(f'Time\'s up! The correct answer was **{correct}**.')
+        return
+
+    if reply.content.lower() == correct.lower():
+        daily_trivia_scores[ctx.author.id] = daily_trivia_scores.get(ctx.author.id, 0) + 1
+        await ctx.send(f'✅ Correct! Score today: {daily_trivia_scores[ctx.author.id]}')
+    else:
+        await ctx.send(f'❌ Sorry, the correct answer was **{correct}**.')
+
+
+# ───────────  Anime search  ───────────
 @bot.command()
-async def voicealerts(ctx, action: str = None):
-    """Subscribe or unsubscribe to voice channel join alerts. Usage: !voicealerts <subscribe/unsubscribe>"""
-    if action == "subscribe":
-        if ctx.author.id not in voice_channel_alerts_subscribers:
-            voice_channel_alerts_subscribers.add(ctx.author.id)
-            await ctx.send(f"{ctx.author.mention} You have subscribed to voice channel join alerts.")
+async def anime(ctx, *, title: str):
+    """Quick anime lookup via Jikan API."""
+    r = requests.get(f'https://api.jikan.moe/v4/anime?q={title}&limit=1').json()
+    if not r['data']:
+        await ctx.send("No results.")
+        return
+
+    d = r['data'][0]
+    embed = discord.Embed(
+        title=d['title'], url=d['url'], description=d['synopsis'][:1000] + '…',
+        color=0x00ff00
+    )
+    embed.set_thumbnail(url=d['images']['jpg']['image_url'])
+    embed.add_field(name='Episodes', value=d['episodes'])
+    embed.add_field(name='Score', value=d['score'])
+    embed.add_field(name='Aired', value=f"{d['aired']['from'][:10]} → {d['aired']['to'][:10]}")
+    await ctx.send(embed=embed)
+
+
+# ───────────  Voice‑channel join alerts  ───────────
+@bot.command()
+async def voicealerts(ctx, action: str | None = None):
+    """`!voicealerts subscribe` or `!voicealerts unsubscribe`"""
+    if action == 'subscribe':
+        if ctx.author.id in voice_channel_alerts_subscribers:
+            await ctx.send("You’re already subscribed.")
         else:
-            await ctx.send(f"{ctx.author.mention} You are already subscribed to voice channel join alerts.")
-    elif action == "unsubscribe":
+            voice_channel_alerts_subscribers.add(ctx.author.id)
+            await ctx.send("🔔 Subscribed to voice‑channel join alerts.")
+    elif action == 'unsubscribe':
         if ctx.author.id in voice_channel_alerts_subscribers:
             voice_channel_alerts_subscribers.remove(ctx.author.id)
-            await ctx.send(f"{ctx.author.mention} You have unsubscribed from voice channel join alerts.")
+            await ctx.send("❎ Unsubscribed from voice‑channel join alerts.")
         else:
-            await ctx.send(f"{ctx.author.mention} You are not subscribed to voice channel join alerts.")
+            await ctx.send("You’re not subscribed.")
     else:
-        await ctx.send(f"Invalid action. Please use !voicealerts <subscribe/unsubscribe>.")
+        await ctx.send("Usage: `!voicealerts <subscribe|unsubscribe>`")
 
-# Event: on_voice_state_update to monitor users joining voice channels
-@bot.event
-async def on_voice_state_update(member, before, after):
-    # Check if the user joined a voice channel
-    if before.channel is None and after.channel is not None:
-        # Notify all subscribers via DM
-        for subscriber_id in voice_channel_alerts_subscribers:
-            try:
-                subscriber = await bot.fetch_user(subscriber_id)
-                await subscriber.send(f"{member.name} has joined the voice channel {after.channel.name}.")
-            except Exception as e:
-                print(f"Failed to send DM to {subscriber_id}: {e}")
 
-# Helper instructions for wrong commands
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
-        helper_text = ("Invalid command. Here are some commands you can use:\n"
-                       "!poll <question> - Create a poll with thumbs up and thumbs down reactions.\n"
-                       "!remindme <time> <reminder> - Set a reminder.\n"
-                       "!count <time> - Start a countdown.\n"
-                       "!predict <name> - Predict the nationality based on the name.\n"
-                       "!emojistats - Show the most used emojis in the channel.\n"
-                       "!dailytrivia - Participate in a daily trivia challenge.\n"
-                       "!anime <title> - Search for an anime.\n"
-                       "!voicealerts <subscribe/unsubscribe> - Subscribe or unsubscribe to voice channel join alerts.")
-        await ctx.send(helper_text)
-    else:
-        await ctx.send(f"An error occurred: {str(error)}")
-
-# Nationality prediction functions
-def get_country_prediction(name):
-    # Replace spaces with + to fit the API requirement
-    formatted_name = name.replace(" ", "+")
-    url = f"https://api.nationalize.io/?name={formatted_name}"
-    response = requests.get(url)
-
-    if response.status_code == 200:
-        return response.json()
-    else:
-        return None
-
-def get_country_flag(country_code):
-    OFFSET = 127397
-    return chr(ord(country_code[0]) + OFFSET) + chr(ord(country_code[1]) + OFFSET)
-
-def display_country_predictions(predictions):
-    if not predictions:
-        return "No predictions available."
-
-    result = f"Name: {predictions['name']}\n"
-    for country in predictions['country']:
-        country_id = country['country_id']
-        probability = country['probability']
-        country_flag = get_country_flag(country_id)
-        result += f"Country: {country_id} {country_flag}, Probability: {probability:.2f}\n"
-
-    return result
-
-# Predict command
-@bot.command(name='predict')
-async def predict(ctx, *, name: str):
-    """Predict the nationality based on the name. Usage: !predict <name>"""
-    predictions = get_country_prediction(name)
-
-    if predictions:
-        result = display_country_predictions(predictions)
-        await ctx.send(result)
-    else:
-        await ctx.send("Error retrieving predictions.")
-
-# Run the bot
+# ────────────────────────────  Run  ────────────────────────────
 bot.run(TOKEN)
